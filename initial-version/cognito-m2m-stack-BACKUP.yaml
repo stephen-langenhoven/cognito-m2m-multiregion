@@ -1,0 +1,469 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cognito M2M Token Caching Service - Fixed Configuration for Client Credentials Grant'
+
+Resources:
+  # Cognito User Pool for M2M authentication
+  TestUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: 'cognito-m2m-test-pool'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+
+  # Resource Server - Required for client credentials grant
+  TokenServiceResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref TestUserPool
+      Identifier: 'token-service-api'
+      Name: 'Token Service API'
+      Scopes:
+        - ScopeName: 'read'
+          ScopeDescription: 'Read access to token service'
+        - ScopeName: 'write'
+          ScopeDescription: 'Write access to token service'
+        - ScopeName: 'cache'
+          ScopeDescription: 'Access to token cache operations'
+
+  # User Pool Client configured for M2M with client credentials grant
+  TestUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: TokenServiceResourceServer
+    Properties:
+      UserPoolId: !Ref TestUserPool
+      ClientName: 'test-m2m-client'
+      GenerateSecret: true
+      # Remove ExplicitAuthFlows - not needed for M2M
+      # Use AllowedOAuthFlows for client credentials grant
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - token-service-api/read
+        - token-service-api/write
+        - token-service-api/cache
+      # Token validity settings
+      AccessTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: hours
+
+  # DynamoDB Tables with encryption
+  TokenCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'TokenCache'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cache_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cache_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Purpose
+          Value: TokenCaching
+        - Key: Environment
+          Value: Test
+
+  PartnerConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'PartnerConfig'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: partner_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: partner_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Purpose
+          Value: PartnerConfiguration
+        - Key: Environment
+          Value: Test
+
+  # Lambda Execution Role with least privilege
+  TokenServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt TokenCacheTable.Arn
+                  - !GetAtt PartnerConfigTable.Arn
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:InitiateAuth
+                Resource: !GetAtt TestUserPool.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/TokenService:*'
+
+  # Lambda Function with updated runtime
+  TokenServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'TokenService'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TokenServiceRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TOKEN_CACHE_TABLE: !Ref TokenCacheTable
+          PARTNER_CONFIG_TABLE: !Ref PartnerConfigTable
+          COGNITO_USER_POOL_ID: !Ref TestUserPool
+          COGNITO_CLIENT_ID: !Ref TestUserPoolClient
+          COGNITO_DOMAIN: !Sub '${TestUserPool}.auth.${AWS::Region}.amazoncognito.com'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          import base64
+          import urllib.request
+          import urllib.error
+          import urllib.parse
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  # Extract partner_id from query parameters
+                  query_params = event.get('queryStringParameters') or {}
+                  partner_id = query_params.get('partner_id')
+                  
+                  if not partner_id:
+                      return error_response(400, 'Missing partner_id parameter')
+                  
+                  cache_key = f"{partner_id}_token"
+                  
+                  # Check cache first
+                  cached_token = get_cached_token(cache_key)
+                  if cached_token:
+                      logger.info(f"Token found in cache for partner: {partner_id}")
+                      return success_response(cached_token, 'cache')
+                  
+                  # Cache miss - get partner configuration
+                  partner_config = get_partner_config(partner_id)
+                  if not partner_config:
+                      logger.warning(f"Partner configuration not found: {partner_id}")
+                      return error_response(404, 'Partner configuration not found')
+                  
+                  # Get new token using client credentials grant
+                  token = get_cognito_token_client_credentials()
+                  if not token:
+                      return error_response(500, 'Failed to obtain token from Cognito')
+                  
+                  # Store in cache
+                  store_token_cache(cache_key, token, partner_id)
+                  logger.info(f"New token obtained and cached for partner: {partner_id}")
+                  
+                  return success_response(token, 'cognito')
+                  
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return error_response(500, 'Internal server error')
+          
+          def get_cached_token(cache_key):
+              table = dynamodb.Table(os.environ['TOKEN_CACHE_TABLE'])
+              try:
+                  response = table.get_item(Key={'cache_key': cache_key})
+                  if 'Item' in response:
+                      # Check if token is still valid (not expired)
+                      ttl = response['Item'].get('ttl', 0)
+                      if ttl > int(datetime.now().timestamp()):
+                          return response['Item']['token']
+                      else:
+                          logger.info(f"Cached token expired for key: {cache_key}")
+              except Exception as e:
+                  logger.error(f"Error retrieving cached token: {str(e)}")
+              return None
+          
+          def get_partner_config(partner_id):
+              table = dynamodb.Table(os.environ['PARTNER_CONFIG_TABLE'])
+              try:
+                  response = table.get_item(Key={'partner_id': partner_id})
+                  return response.get('Item')
+              except Exception as e:
+                  logger.error(f"Error retrieving partner config: {str(e)}")
+                  return None
+          
+          def get_cognito_token_client_credentials():
+              try:
+                  # Get partner configuration to retrieve client credentials
+                  partner_config = get_partner_config("test-partner-001")  # In production, this would be dynamic
+                  if not partner_config:
+                      logger.error("Partner configuration not found for token request")
+                      return None
+                  
+                  # Prepare OAuth 2.0 client credentials request
+                  client_id = partner_config['cognito_client_id']
+                  client_secret = partner_config['cognito_client_secret']
+                  domain = partner_config.get('cognito_domain', 'default-domain')
+                  
+                  token_url = f"https://{domain}.auth.ca-central-1.amazoncognito.com/oauth2/token"
+                  
+                  # Prepare request data
+                  data = "grant_type=client_credentials&scope=token-service-api/read token-service-api/write token-service-api/cache"
+                  
+                  # Create Basic Auth header
+                  import base64
+                  credentials = f"{client_id}:{client_secret}"
+                  encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                  
+                  # Make the OAuth request
+                  req = urllib.request.Request(
+                      token_url,
+                      data=data.encode(),
+                      headers={
+                          'Content-Type': 'application/x-www-form-urlencoded',
+                          'Authorization': f'Basic {encoded_credentials}'
+                      }
+                  )
+                  
+                  with urllib.request.urlopen(req) as response:
+                      response_data = json.loads(response.read().decode())
+                      access_token = response_data.get('access_token')
+                      
+                      if access_token:
+                          logger.info("Successfully obtained access token from Cognito")
+                          return access_token
+                      else:
+                          logger.error("No access token in Cognito response")
+                          return None
+                  
+              except urllib.error.HTTPError as e:
+                  logger.error(f"HTTP error obtaining Cognito token: {e.code} - {e.read().decode()}")
+                  return None
+              except Exception as e:
+                  logger.error(f"Error obtaining Cognito token: {str(e)}")
+                  return None
+          
+          def store_token_cache(cache_key, token, partner_id):
+              table = dynamodb.Table(os.environ['TOKEN_CACHE_TABLE'])
+              # Set TTL to 50 minutes (token expires in 1 hour)
+              ttl = int((datetime.now() + timedelta(minutes=50)).timestamp())
+              
+              try:
+                  table.put_item(
+                      Item={
+                          'cache_key': cache_key,
+                          'token': token,
+                          'partner_id': partner_id,
+                          'ttl': ttl,
+                          'created_at': datetime.now().isoformat()
+                      }
+                  )
+                  logger.info(f"Token cached successfully for partner: {partner_id}")
+              except Exception as e:
+                  logger.error(f"Error storing token in cache: {str(e)}")
+          
+          def success_response(token, source):
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({
+                      'access_token': token,
+                      'source': source,
+                      'timestamp': datetime.now().isoformat()
+                  })
+              }
+          
+          def error_response(status_code, message):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({
+                      'error': message,
+                      'timestamp': datetime.now().isoformat()
+                  })
+              }
+
+  # API Gateway with throttling
+  TokenServiceApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: 'TokenService'
+      Description: 'M2M Token Caching Service API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  TokenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      ParentId: !GetAtt TokenServiceApi.RootResourceId
+      PathPart: token
+
+  TokenMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      ResourceId: !Ref TokenResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TokenServiceFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # CORS Options method
+  TokenOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      ResourceId: !Ref TokenResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - TokenMethod
+      - TokenOptionsMethod
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      StageName: 'dev'
+
+  # API Gateway throttling
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: 'TokenServiceUsagePlan'
+      Description: 'Usage plan for Token Service API'
+      ApiStages:
+        - ApiId: !Ref TokenServiceApi
+          Stage: 'dev'
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TokenServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TokenServiceApi}/*/*'
+
+Outputs:
+  TokenServiceUrl:
+    Description: 'Token Service API Gateway URL'
+    Value: !Sub 'https://${TokenServiceApi}.execute-api.${AWS::Region}.amazonaws.com/dev/token'
+    Export:
+      Name: !Sub '${AWS::StackName}-TokenServiceUrl'
+
+  CognitoUserPoolId:
+    Description: 'Created Cognito User Pool ID'
+    Value: !Ref TestUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  CognitoClientId:
+    Description: 'Created Cognito Client ID'
+    Value: !Ref TestUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-ClientId'
+
+  ResourceServerId:
+    Description: 'Created Resource Server ID'
+    Value: !Ref TokenServiceResourceServer
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceServerId'
+
+  PartnerConfigTableName:
+    Description: 'DynamoDB table name for partner configuration'
+    Value: !Ref PartnerConfigTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PartnerConfigTable'
+
+  TokenCacheTableName:
+    Description: 'DynamoDB table name for token cache'
+    Value: !Ref TokenCacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TokenCacheTable'

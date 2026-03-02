@@ -1,0 +1,369 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cognito M2M Token Caching Service - Fixed Configuration for Client Credentials Grant'
+
+Parameters:
+  application:
+    Type: String
+    Description: Application Name
+  environment:
+    Type: String
+    Description: Application environment
+  resourceid:
+    Type: String
+    Description: ID of the resource server
+
+
+Resources:
+
+  # ================================= #
+  # DYNAMO DB TABLES
+  # ================================= #
+
+  TokenCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${application}-${environment}-AccessTokenCache'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: application
+          Value: !Ref application
+        - Key: environment
+          Value: !Ref environment
+
+  ExternalClientTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${application}-${environment}-ExternalClient'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Purpose
+          Value: PartnerConfiguration
+        - Key: Environment
+          Value: Test
+
+
+
+  # ================================= #
+  # ACCESS TOKEN ENRICHMENT LAMBDA
+  # ================================= #
+
+  TokenEnrichmentServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt ExternalClientTable.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${application}-${environment}-token_enrichment-function:*'
+
+
+  # Lambda Function with updated runtime
+  TokenEnrichmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${application}-${environment}-token_enrichment-function'
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt TokenEnrichmentServiceRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          EXTERNAL_CLIENT_TABLE: !Ref ExternalClientTable
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+            return "This is the access token enrichment lambda"
+
+
+  # ================================= #
+  # COGNITO USER POOL
+  # ================================= #
+
+  # Cognito User Pool for M2M authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${application}-${environment}-m2m-userpool'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+      UserPoolTags:
+        application: !Ref application
+        environment: !Ref environment
+
+  # Resource Server - Required for client credentials grant
+  TokenServiceResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Ref resourceid
+      Name: !Sub '${application} ${environment} Resource Server'
+      Scopes:
+        - ScopeName: 'generate_token'
+          ScopeDescription: 'Generate a JWT'
+
+
+  # ================================= #
+  # ACCESS TOKEN LAMBDA FUNCTION
+  # ================================= #
+
+  # Lambda Execution Role with least privilege
+  TokenServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt TokenCacheTable.Arn
+                  - !GetAtt ExternalClientTable.Arn
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:InitiateAuth
+                Resource: !GetAtt UserPool.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${application}-${environment}-token_service-function:*'
+
+
+  # Lambda Function with updated runtime
+  TokenServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${application}-${environment}-token_service-function'
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt TokenServiceRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TOKEN_CACHE_TABLE: !Ref TokenCacheTable
+          EXTERNAL_CLIENT_TABLE: !Ref ExternalClientTable
+          COGNITO_USER_POOL_ID: !Ref UserPool
+          COGNITO_DOMAIN: !Sub '${UserPool}.auth.${AWS::Region}.amazoncognito.com'
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+            return "This is the access token lambda"
+
+
+  # ================================= #
+  # API GATEWAY
+  # ================================= #
+
+
+  # API Gateway with throttling
+  TokenServiceApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${application}-${environment}-token_service'
+      Description: 'M2M Token Caching Service API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  TokenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      ParentId: !GetAtt TokenServiceApi.RootResourceId
+      PathPart: token
+
+  TokenMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      ResourceId: !Ref TokenResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TokenServiceFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # CORS Options method
+  TokenOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      ResourceId: !Ref TokenResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TokenMethod
+      - TokenOptionsMethod
+    Properties:
+      RestApiId: !Ref TokenServiceApi
+      StageName: 'dev'
+
+  # API Gateway throttling
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: 'TokenServiceUsagePlan'
+      Description: 'Usage plan for Token Service API'
+      ApiStages:
+        - ApiId: !Ref TokenServiceApi
+          Stage: 'dev'
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TokenServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TokenServiceApi}/*/*'
+
+#Outputs:
+#  TokenServiceUrl:
+#    Description: 'Token Service API Gateway URL'
+#    Value: !Sub 'https://${TokenServiceApi}.execute-api.${AWS::Region}.amazonaws.com/dev/token'
+#    Export:
+#      Name: !Sub '${AWS::StackName}-TokenServiceUrl'
+#
+#  CognitoUserPoolId:
+#    Description: 'Created Cognito User Pool ID'
+#    Value: !Ref TestUserPool
+#    Export:
+#      Name: !Sub '${AWS::StackName}-UserPoolId'
+#
+#  CognitoClientId:
+#    Description: 'Created Cognito Client ID'
+#    Value: !Ref TestUserPoolClient
+#    Export:
+#      Name: !Sub '${AWS::StackName}-ClientId'
+#
+#  ResourceServerId:
+#    Description: 'Created Resource Server ID'
+#    Value: !Ref TokenServiceResourceServer
+#    Export:
+#      Name: !Sub '${AWS::StackName}-ResourceServerId'
+#
+#  PartnerConfigTableName:
+#    Description: 'DynamoDB table name for partner configuration'
+#    Value: !Ref PartnerConfigTable
+#    Export:
+#      Name: !Sub '${AWS::StackName}-PartnerConfigTable'
+#
+#  TokenCacheTableName:
+#    Description: 'DynamoDB table name for token cache'
+#    Value: !Ref TokenCacheTable
+#    Export:
+#      Name: !Sub '${AWS::StackName}-TokenCacheTable'
